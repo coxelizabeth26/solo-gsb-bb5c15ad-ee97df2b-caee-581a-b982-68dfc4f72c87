@@ -12,6 +12,7 @@ const MAX_PARENTS_PER_CHILD = 2;
 const MAX_MEMBERS = 30;
 const MAX_BATCH_EDGES = 100;
 const MAX_BACKUP_NAME_LENGTH = 50;
+const MAX_DESCENDANT_GENERATIONS = 10;
 
 const { ANNIVERSARY_TYPES, TYPE_LABEL, validateMonthDay } = require('./anniversaries');
 
@@ -469,6 +470,94 @@ function findCommonAncestors(state, idA, idB) {
     minTotalGen: minTotalGen === Infinity ? null : minTotalGen,
     ancestors: nearest,
   };
+}
+
+/**
+ * 后代支系视图（纯函数，不修改 state、不写入任何数据）。
+ *
+ * 以 rootId 为「始祖」、maxGen 为代数上限（1～MAX_DESCENDANT_GENERATIONS 的整数），
+ * 沿「父母 → 子女」关系向下提取后代支系：
+ *   - 同一后代经多条路径到达时只出现一次，gen 取距始祖的**最短代数**（BFS 首达步数）；
+ *   - 每个成员标记其所属的**全部始祖直系子女分支**：分支以始祖的每位直系子女
+ *     （第 1 代成员）为起点，只要在提取出的支系子图中该起点沿父母→子女关系
+ *     向下可到达此成员（不限于最短路径），此成员即属于该分支；
+ *   - 仅保留**两端都在支系内**的亲子关系：父母或子女任一不在提取结果中的边
+ *     （如支系外成员的亲子关系、超出代数上限的边）一律不带入。
+ *
+ * 返回 { error } 或 {
+ *   rootId, maxGen,
+ *   branchRoots: [id],                       // 始祖的直系子女（各分支起点），按 id 排序
+ *   members: [{ id, gen, branches: [id] }],  // 按 (gen, id) 排序；始祖 gen 0、branches 为空
+ *   edges: [{ parentId, childId }],          // 支系内关系，按 (childId, parentId) 排序
+ * }
+ */
+function descendantBranches(state, rootId, maxGen) {
+  if (!hasMember(state, rootId)) return { error: '成员不存在' };
+  if (!Number.isInteger(maxGen) || maxGen < 1 || maxGen > MAX_DESCENDANT_GENERATIONS) {
+    return { error: `代数上限必须是 1～${MAX_DESCENDANT_GENERATIONS} 的整数` };
+  }
+
+  // 子女邻接表：childrenOf[parent] = [child, ...]（沿父母→子女向下）
+  const childrenOf = {};
+  for (const [childId, parents] of Object.entries(state.parentsOf || {})) {
+    for (const parentId of parents) (childrenOf[parentId] ||= []).push(childId);
+  }
+
+  // BFS 向下：gen 为距始祖的最短代数，最多向下 maxGen 层
+  const genOf = new Map([[rootId, 0]]);
+  const queue = [rootId];
+  for (let head = 0; head < queue.length; head++) {
+    const cur = queue[head];
+    const gen = genOf.get(cur);
+    if (gen >= maxGen) continue;
+    for (const childId of childrenOf[cur] || []) {
+      if (!genOf.has(childId)) {
+        genOf.set(childId, gen + 1);
+        queue.push(childId);
+      }
+    }
+  }
+  const included = new Set(genOf.keys());
+
+  // 支系内关系：仅保留父母与子女都在提取结果中的边
+  const edges = [];
+  for (const childId of included) {
+    for (const parentId of state.parentsOf[childId] || []) {
+      if (included.has(parentId)) edges.push({ parentId, childId });
+    }
+  }
+  edges.sort((a, b) =>
+    a.childId === b.childId
+      ? a.parentId.localeCompare(b.parentId)
+      : a.childId.localeCompare(b.childId),
+  );
+
+  // 分支起点：距始祖 1 代的成员即始祖的直系子女
+  const branchRoots = [...included].filter((id) => genOf.get(id) === 1);
+  branchRoots.sort((a, b) => a.localeCompare(b));
+
+  // 分支归属：从每个分支起点沿支系内边向下可达（含起点自身）的成员都属于该分支。
+  // 按分支起点顺序逐个 DFS，每个成员的分支列表自然按起点顺序排列。
+  const branchesOf = new Map([...included].map((id) => [id, []]));
+  for (const branchRoot of branchRoots) {
+    const stack = [branchRoot];
+    const seen = new Set();
+    while (stack.length) {
+      const cur = stack.pop();
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      branchesOf.get(cur).push(branchRoot);
+      for (const childId of childrenOf[cur] || []) {
+        if (included.has(childId)) stack.push(childId);
+      }
+    }
+  }
+
+  const members = [...included]
+    .sort((a, b) => genOf.get(a) - genOf.get(b) || a.localeCompare(b))
+    .map((id) => ({ id, gen: genOf.get(id), branches: branchesOf.get(id) }));
+
+  return { error: null, rootId, maxGen, branchRoots, members, edges };
 }
 
 /**
@@ -973,6 +1062,7 @@ module.exports = {
   MAX_MEMBERS,
   MAX_BATCH_EDGES,
   MAX_BACKUP_NAME_LENGTH,
+  MAX_DESCENDANT_GENERATIONS,
   createState,
   getMember,
   isReachableUp,
@@ -982,6 +1072,7 @@ module.exports = {
   previewMergeMembers,
   allShortestPathsUp,
   findCommonAncestors,
+  descendantBranches,
   ancestorProfiles,
   findGenerationConflicts,
   previewEdgeImpact,

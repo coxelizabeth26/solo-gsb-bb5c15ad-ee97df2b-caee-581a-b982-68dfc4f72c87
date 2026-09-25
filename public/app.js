@@ -29,6 +29,7 @@ const selection = {
   mergeRemove: '',
   impactParent: '',
   impactChild: '',
+  branchRoot: '',
 };
 
 let queryStale = false; // 关系被修改后，共同祖先查询结果标记为过期
@@ -54,6 +55,12 @@ let restoreStaleReason = '';
 
 // 未来 30 天纪念日清单（服务端按浏览器提交的本地日期计算）：{ from, days, items }
 let upcoming = null;
+
+// 最近一次后代支系视图结果（服务端返回，含 version）
+// 结果保持展示；家谱发生写入或查询条件变化后标记为过期并提示重新生成
+let branchResult = null;
+let branchStale = false;
+let branchStaleReason = '';
 
 const $ = (id) => document.getElementById(id);
 
@@ -120,6 +127,9 @@ async function refresh() {
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
+  if (versionChanged && branchResult && !branchStale) {
+    invalidateBranchResult('家谱已发生写入，以下支系视图基于旧版本，请重新生成');
+  }
   render();
   loadUpcoming();
 }
@@ -139,6 +149,9 @@ function applyStateAndRender(data) {
   }
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
+  }
+  if (versionChanged && branchResult && !branchStale) {
+    invalidateBranchResult('家谱已发生写入，以下支系视图基于旧版本，请重新生成');
   }
   render();
   loadUpcoming();
@@ -357,6 +370,7 @@ function renderSelects() {
   fillSelect($('merge-remove'), selection.mergeRemove, '选择被合并成员');
   fillSelect($('impact-parent'), selection.impactParent, '选择父母');
   fillSelect($('impact-child'), selection.impactChild, '选择子女');
+  fillSelect($('branch-root'), selection.branchRoot, '选择始祖');
 }
 
 function fillSelect(select, selectedId, placeholder) {
@@ -393,6 +407,13 @@ function renderStaleBanner() {
     impactStale,
     `⚠️ ${impactStaleReason || '家谱在上次预览后发生过写入，以下结果可能已过期，请重新预览。'}`,
   );
+  renderOneStaleBanner(
+    $('branch-result'),
+    branchStale,
+    `⚠️ ${branchStaleReason || '家谱在上次生成后发生过写入，以下结果可能已过期，请重新生成。'}`,
+  );
+  // 结果过期或尚未生成时禁止下载，避免导出与展示不一致的旧数据
+  $('branch-export').disabled = !(branchResult && !branchStale);
 }
 
 function renderOneStaleBanner(box, stale, message) {
@@ -455,6 +476,7 @@ function syncSelectionFromForm() {
   selection.mergeRemove = $('merge-remove').value;
   selection.impactParent = $('impact-parent').value;
   selection.impactChild = $('impact-child').value;
+  selection.branchRoot = $('branch-root').value;
 }
 
 $('edge-parent').addEventListener('change', syncSelectionFromForm);
@@ -1265,6 +1287,155 @@ function renderImpactResult(data) {
   if (data.changed.length > 0) box.appendChild(renderImpactGroup('代数范围变化的矛盾', data.changed));
 }
 
+/* ---------------- 后代支系视图 ---------------- */
+
+function invalidateBranchResult(reason) {
+  branchStale = true;
+  branchStaleReason = reason;
+  renderStaleBanner();
+}
+
+// 查询条件（始祖 / 代数上限）一旦改变，旧结果立即标记过期
+$('branch-root').addEventListener('change', () => {
+  syncSelectionFromForm();
+  invalidateBranchResult('查询条件已修改，以下结果与当前选择不符，请重新生成');
+});
+$('branch-max-gen').addEventListener('change', () => {
+  invalidateBranchResult('查询条件已修改，以下结果与当前选择不符，请重新生成');
+});
+
+/** 生成支系视图：只读查询，服务端按当前最新家谱状态计算 */
+$('branch-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  syncSelectionFromForm();
+  const rootId = selection.branchRoot;
+  const maxGen = $('branch-max-gen').value;
+  if (!rootId) { toast('请选择始祖成员', true); return; }
+  try {
+    const params = new URLSearchParams({ root: rootId, maxGen });
+    const data = await api(`/api/descendant-branches?${params.toString()}`);
+    // 请求往返期间查询条件可能已被改动：结果只对当时的条件快照有效
+    if (rootId !== selection.branchRoot || maxGen !== $('branch-max-gen').value) {
+      invalidateBranchResult('查询条件在生成期间已变化，请重新生成');
+      return;
+    }
+    branchResult = data;
+    branchStale = false;
+    branchStaleReason = '';
+    renderBranchResult(data);
+    renderStaleBanner();
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+/** 下载当前结果：局部导出（成员 ID、姓名、代数、分支及支系内关系），注明非整谱备份 */
+$('branch-export').addEventListener('click', () => {
+  if (!branchResult || branchStale) { toast('请先生成最新的支系视图', true); return; }
+  const d = branchResult;
+  const doc = {
+    note:
+      `局部导出：仅含以「${d.rootName}」为始祖、${d.maxGen} 代以内的后代支系视图` +
+      '（成员 ID、姓名、代数、所属分支与支系内亲子关系），不是整谱备份；' +
+      '整谱备份请使用「⑥ 备份与恢复」下载。',
+    exportedAt: new Date().toISOString(),
+    familyVersion: d.version,
+    root: { id: d.rootId, name: d.rootName },
+    maxGen: d.maxGen,
+    memberCount: d.memberCount,
+    edgeCount: d.edgeCount,
+    branches: d.branches,
+    members: d.members,
+    edges: d.edges,
+  };
+  const blob = new Blob([`${JSON.stringify(doc, null, 2)}\n`], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const date = new Date().toISOString().slice(0, 10);
+  const a = el('a', {
+    href: url,
+    download: `family-branch-${d.rootName}-${d.maxGen}代-${date}.json`,
+  });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  toast(`已下载支系视图 JSON（${d.memberCount} 名成员、${d.edgeCount} 条关系；局部导出，非整谱备份）`);
+});
+
+function renderBranchResult(data) {
+  const box = $('branch-result');
+  box.replaceChildren();
+  box.dataset.hasResult = '1';
+
+  const summary = el('div', { class: 'summary' });
+  summary.appendChild(el('div', {}, [
+    document.createTextNode('始祖 '),
+    el('strong', { text: `「${data.rootName}」` }),
+    document.createTextNode(`，${data.maxGen} 代以内共 `),
+    el('strong', { text: `${data.memberCount} 名成员` }),
+    document.createTextNode('（含始祖）、'),
+    el('strong', { text: `${data.edgeCount} 条` }),
+    document.createTextNode(`支系内亲子关系（基于家谱版本 ${data.version}）。`),
+  ]));
+  summary.appendChild(el('div', {
+    class: 'empty-hint',
+    text: data.branches.length > 0
+      ? `共 ${data.branches.length} 个始祖直系子女分支：${data.branches.map((b) => `「${b.name}」${b.memberCount} 人`).join('、')}。`
+      : '该成员在所选代数上限内没有后代。',
+  }));
+  box.appendChild(summary);
+
+  // 按距始祖的最短代数分组展示
+  const byGen = new Map();
+  for (const m of data.members) {
+    if (!byGen.has(m.gen)) byGen.set(m.gen, []);
+    byGen.get(m.gen).push(m);
+  }
+  const groups = el('div', { class: 'branch-gens' });
+  for (const [gen, members] of [...byGen.entries()].sort((a, b) => a[0] - b[0])) {
+    const group = el('div', { class: 'branch-gen-group' });
+    group.appendChild(el('h3', {
+      class: 'list-title',
+      text: gen === 0 ? '第 0 代（始祖）' : `第 ${gen} 代（${members.length} 人）`,
+    }));
+    const chips = el('div', { class: 'branch-members' });
+    for (const m of members) {
+      const chip = el('span', { class: 'branch-member' });
+      chip.appendChild(el('span', { class: 'name', text: m.name }));
+      for (const b of m.branches) {
+        chip.appendChild(el('span', { class: 'branch-tag', text: `${b.name}系` }));
+      }
+      chips.appendChild(chip);
+    }
+    group.appendChild(chips);
+    groups.appendChild(group);
+  }
+  box.appendChild(groups);
+
+  // 支系内亲子关系（仅两端都在支系中的关系）
+  const edgeBox = el('div', { class: 'branch-edges' });
+  edgeBox.appendChild(el('h3', { class: 'list-title', text: `支系内亲子关系（${data.edgeCount} 条）` }));
+  if (data.edges.length === 0) {
+    edgeBox.appendChild(el('p', {
+      class: 'empty-hint',
+      text: '支系内没有父母→子女关系（仅展示父母与子女都在支系中的关系）。',
+    }));
+  } else {
+    const list = el('ul', { class: 'edge-list' });
+    for (const e of data.edges) {
+      const li = el('li');
+      li.appendChild(el('span', { class: 'edge-text' }, [
+        el('span', { class: 'p-name', text: e.parentName }),
+        document.createTextNode(' → '),
+        el('span', { class: 'c-name', text: e.childName }),
+      ]));
+      list.appendChild(li);
+    }
+    edgeBox.appendChild(list);
+  }
+  box.appendChild(edgeBox);
+}
+
 /* ---------------- 备份与恢复 ---------------- */
 
 function invalidateRestorePreview(reason) {
@@ -1663,5 +1834,12 @@ async function clearAnniversaries(member) {
 }
 
 /* ---------------- 启动 ---------------- */
+
+// 代数上限选项（1～10 代，默认 3 代）
+const branchMaxGenSelect = $('branch-max-gen');
+for (let g = 1; g <= 10; g += 1) {
+  branchMaxGenSelect.appendChild(el('option', { value: String(g), text: `${g} 代` }));
+}
+branchMaxGenSelect.value = '3';
 
 refresh().catch((err) => toast(`初始化失败：${err.message}`, true));

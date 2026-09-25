@@ -8,6 +8,8 @@ const {
   findGenerationConflicts,
   validateEdge,
   previewEdgeImpact,
+  descendantBranches,
+  MAX_DESCENDANT_GENERATIONS,
 } = require('./familyGraph');
 const { parseLocalDate, upcomingAnniversaries } = require('./anniversaries');
 
@@ -485,6 +487,57 @@ app.get('/api/generation-conflicts', (req, res) => {
       diff: c.diff,
       shortestPath: decoratePath(c.shortestPath),
       longestPath: decoratePath(c.longestPath),
+    })),
+  });
+});
+
+/**
+ * 后代支系视图（只读，不写入任何数据）：
+ * 以 root 为「始祖」、maxGen（1～10 的整数）为代数上限，沿父母→子女关系向下提取后代。
+ * 同一后代经多条路径到达时只出现一次，按距始祖的最短代数（BFS 首达）分组，
+ * 并标记其所属的每个始祖直系子女分支（在提取出的支系子图上做可达性判定，
+ * 不限于最短路径）；仅保留两端都在支系内的亲子关系，不带入支系外成员。
+ * 成员或关系变更后重新查询即得到最新结果；响应携带当前家谱版本 version，
+ * 页面据此在发生写入后提示重新生成。
+ * 查询参数：root=<成员 id>&maxGen=<1-10 的整数>
+ */
+app.get('/api/descendant-branches', (req, res) => {
+  const rootId = typeof req.query.root === 'string' ? req.query.root.trim() : '';
+  if (!rootId) return sendError(res, 400, '请选择始祖成员');
+  const maxGenRaw = typeof req.query.maxGen === 'string' ? req.query.maxGen.trim() : '';
+  const maxGen = Number(maxGenRaw);
+  if (!Number.isInteger(maxGen) || maxGen < 1 || maxGen > MAX_DESCENDANT_GENERATIONS) {
+    return sendError(res, 400, `代数上限必须是 1～${MAX_DESCENDANT_GENERATIONS} 的整数`);
+  }
+  const result = descendantBranches(store.getState(), rootId, maxGen);
+  if (result.error) return sendError(res, 404, result.error);
+
+  const byId = new Map(store.list().members.map((m) => [m.id, m.name]));
+  const nameOf = (id) => byId.get(id) || '（已删除）';
+
+  res.json({
+    version: store.getVersion(),
+    rootId,
+    rootName: nameOf(rootId),
+    maxGen,
+    memberCount: result.members.length,
+    edgeCount: result.edges.length,
+    branches: result.branchRoots.map((id) => ({
+      id,
+      name: nameOf(id),
+      memberCount: result.members.filter((m) => m.branches.includes(id)).length,
+    })),
+    members: result.members.map((m) => ({
+      id: m.id,
+      name: nameOf(m.id),
+      gen: m.gen,
+      branches: m.branches.map((id) => ({ id, name: nameOf(id) })),
+    })),
+    edges: result.edges.map((e) => ({
+      parentId: e.parentId,
+      parentName: nameOf(e.parentId),
+      childId: e.childId,
+      childName: nameOf(e.childId),
     })),
   });
 });

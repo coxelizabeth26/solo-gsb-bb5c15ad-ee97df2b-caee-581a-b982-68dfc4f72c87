@@ -631,3 +631,40 @@ button.danger-link {
   outline: 2px solid rgba(37, 99, 235, 0.35);
   border-color: var(--primary);
 }
+
+/* 后代支系视图 */
+.branch-gens { margin-bottom: 14px; }
+
+.branch-gen-group { margin-bottom: 10px; }
+
+.branch-gen-group .list-title { margin: 0 0 6px; }
+
+.branch-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.branch-member {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--code-bg);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.88rem;
+}
+
+.branch-member .name { font-weight: 600; word-break: break-all; }
+
+.branch-tag {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border-radius: 999px;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.branch-edges .edge-list { max-height: 240px; }
