@@ -29,6 +29,7 @@ const selection = {
   mergeRemove: '',
   impactParent: '',
   impactChild: '',
+  descendantsRoot: '',
 };
 
 let queryStale = false; // 关系被修改后，共同祖先查询结果标记为过期
@@ -54,6 +55,13 @@ let restoreStaleReason = '';
 
 // 未来 30 天纪念日清单（服务端按浏览器提交的本地日期计算）：{ from, days, items }
 let upcoming = null;
+
+// 后代支系视图：最近一次查询结果（服务端只读计算），以及家谱写入后是否已过期
+// descendantsView: { version, rootId, maxGenerations, members, branches, memberBranches, edges, ... } | null
+let descendantsView = null;
+let descendantsStale = false;
+let descendantsStaleReason = '';
+let descendantsSeq = 0; // 查询序号：防止旧响应覆盖新响应
 
 const $ = (id) => document.getElementById(id);
 
@@ -120,6 +128,7 @@ async function refresh() {
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
+  if (versionChanged && descendantsView) invalidateDescendantsView();
   render();
   loadUpcoming();
 }
@@ -140,6 +149,7 @@ function applyStateAndRender(data) {
   if (versionChanged && restorePreview && !restoreStale) {
     invalidateRestorePreview('家谱已发生写入，以下恢复预览基于旧版本，请重新预览');
   }
+  if (versionChanged && descendantsView) invalidateDescendantsView();
   render();
   loadUpcoming();
 }
@@ -176,6 +186,7 @@ function render() {
   renderRestore();
   renderAnniversaries();
   renderUpcoming();
+  renderDescendants();
 }
 
 /* ---------------- 最近操作与撤销 ---------------- */
@@ -357,6 +368,7 @@ function renderSelects() {
   fillSelect($('merge-remove'), selection.mergeRemove, '选择被合并成员');
   fillSelect($('impact-parent'), selection.impactParent, '选择父母');
   fillSelect($('impact-child'), selection.impactChild, '选择子女');
+  fillSelect($('descendants-root'), selection.descendantsRoot, '选择始祖');
 }
 
 function fillSelect(select, selectedId, placeholder) {
@@ -455,6 +467,7 @@ function syncSelectionFromForm() {
   selection.mergeRemove = $('merge-remove').value;
   selection.impactParent = $('impact-parent').value;
   selection.impactChild = $('impact-child').value;
+  selection.descendantsRoot = $('descendants-root').value;
 }
 
 $('edge-parent').addEventListener('change', syncSelectionFromForm);
@@ -1660,6 +1673,256 @@ async function clearAnniversaries(member) {
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+/* ---------------- 后代支系视图 ---------------- */
+
+/** 家谱发生写入后：旧结果保持展示但标记过期，并按当前表单条件自动重算 */
+function invalidateDescendantsView() {
+  descendantsStale = true;
+  descendantsStaleReason = '成员或关系在上次提取后发生过修改，正在按最新状态重新计算…';
+  renderDescendants();
+  // 始祖可能已在变更中被删除（此时 reconcileSelection 已清空选择）：
+  // 这里直接按最新状态判断成员存在性，不依赖尚未重建的下拉框 DOM
+  const rootExists = state.members.some((m) => m.id === selection.descendantsRoot);
+  if (rootExists) {
+    loadDescendants(selection.descendantsRoot, Number($('descendants-depth').value), { silent: true });
+  } else {
+    descendantsView = null;
+    descendantsStale = false;
+    descendantsStaleReason = '';
+    renderDescendants();
+  }
+}
+
+/** 判断当前展示的结果是否仍对应表单所选的始祖与代数、且基于最新家谱版本 */
+function descendantsViewLive() {
+  if (!descendantsView || descendantsStale) return false;
+  if (descendantsView.version !== state.version) return false;
+  if (descendantsView.rootId !== selection.descendantsRoot) return false;
+  if (descendantsView.maxGenerations !== Number($('descendants-depth').value)) return false;
+  return true;
+}
+
+/** 拉取后代支系视图（只读查询）；silent 时不弹加载提示，用于变更后自动重算 */
+async function loadDescendants(rootId, maxGenerations, { silent = false } = {}) {
+  const seq = ++descendantsSeq;
+  const box = $('descendants-result');
+  if (!silent) {
+    box.replaceChildren(el('p', { class: 'placeholder', text: '提取中…（只读查询，不修改家谱）' }));
+    delete box.dataset.hasResult;
+  }
+  try {
+    const params = new URLSearchParams({ root: rootId, maxGenerations: String(maxGenerations) });
+    const data = await api(`/api/descendants?${params.toString()}`);
+    // 期间用户又发起了新查询：丢弃旧响应
+    if (seq !== descendantsSeq) return;
+    descendantsView = data;
+    descendantsStale = false;
+    descendantsStaleReason = '';
+    renderDescendants();
+  } catch (err) {
+    if (seq !== descendantsSeq) return;
+    descendantsView = null;
+    descendantsStale = false;
+    descendantsStaleReason = '';
+    renderDescendants();
+    if (!silent || err.status !== 404) toast(err.message, true);
+  }
+}
+
+$('descendants-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  syncSelectionFromForm();
+  const rootId = selection.descendantsRoot;
+  const maxGenerations = Number($('descendants-depth').value);
+  if (!rootId) { toast('请选择始祖成员', true); return; }
+  if (!Number.isInteger(maxGenerations) || maxGenerations < 1 || maxGenerations > 10) {
+    toast('代数上限必须是 1 到 10 之间的整数', true);
+    return;
+  }
+  loadDescendants(rootId, maxGenerations);
+});
+
+// 始祖或代数上限变化后，旧结果立即标记为与当前选择不符
+$('descendants-root').addEventListener('change', () => {
+  syncSelectionFromForm();
+  descendantsStale = true;
+  descendantsStaleReason = '始祖已改变，请点击「提取后代支系」。';
+  renderDescendants();
+});
+$('descendants-depth').addEventListener('change', () => {
+  descendantsStale = true;
+  descendantsStaleReason = '代数上限已改变，请点击「提取后代支系」。';
+  renderDescendants();
+});
+
+/** 下载当前结果的局部导出 JSON：服务端按最新家谱即时计算，与视图参数一致；
+ *  若家谱已被其他标签页改动（版本不一致），后台同步刷新视图 */
+$('descendants-download').addEventListener('click', async () => {
+  syncSelectionFromForm();
+  const rootId = selection.descendantsRoot;
+  const maxGenerations = Number($('descendants-depth').value);
+  if (!rootId) { toast('请先选择始祖并提取支系', true); return; }
+  try {
+    const params = new URLSearchParams({ root: rootId, maxGenerations: String(maxGenerations) });
+    const res = await fetch(`/api/descendants/export?${params.toString()}`);
+    if (!res.ok) {
+      let message = `下载失败（${res.status}）`;
+      try {
+        const body = await res.json();
+        if (body && body.error) message = body.error;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    const text = await blob.text();
+    let exportedVersion = null;
+    try {
+      exportedVersion = JSON.parse(text).version;
+    } catch (_) { /* 忽略：不影响下载 */ }
+    const dispo = res.headers.get('Content-Disposition') || '';
+    const match = /filename\*=UTF-8''([^;]+)/.exec(dispo);
+    const filename = match ? decodeURIComponent(match[1]) : 'descendants-export.json';
+    const url = URL.createObjectURL(blob);
+    const a = el('a', { href: url, download: filename });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast('已下载局部导出 JSON（仅当前支系，非整谱备份）');
+    // 下载按服务端最新状态计算：若版本比页面新，后台重查同步视图
+    if (exportedVersion !== null && exportedVersion !== state.version) {
+      refresh().catch(() => {});
+    } else if (descendantsView && descendantsView.version !== exportedVersion) {
+      loadDescendants(rootId, maxGenerations, { silent: true });
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
+
+function renderDescendants() {
+  const box = $('descendants-result');
+  const downloadBtn = $('descendants-download');
+  const live = descendantsViewLive();
+  downloadBtn.disabled = !live;
+
+  if (!descendantsView) {
+    delete box.dataset.hasResult;
+    box.replaceChildren(el('p', {
+      class: 'placeholder',
+      text: '选择一位始祖与代数上限后点击「提取后代支系」。',
+    }));
+    return;
+  }
+  box.dataset.hasResult = '1';
+  box.replaceChildren();
+
+  if (descendantsStale) {
+    box.appendChild(el('p', {
+      class: 'stale-banner',
+      text: `⚠️ ${descendantsStaleReason || '结果可能已过期，请重新提取。'}`,
+    }));
+  }
+
+  const v = descendantsView;
+  const memberCount = v.members.filter((m) => m.generation > 0).length;
+  const summary = el('div', { class: 'summary' });
+  summary.appendChild(el('div', {}, [
+    document.createTextNode('始祖「'),
+    el('strong', { text: v.rootName }),
+    document.createTextNode(`」，代数上限 ${v.maxGenerations} 代（基于家谱版本 ${v.version} 的只读计算）：`),
+  ]));
+  summary.appendChild(el('div', {}, [
+    document.createTextNode('支系内共 '),
+    el('strong', { text: `${memberCount} 名后代` }),
+    document.createTextNode(`（不含始祖本人），分属 ${v.branches.length} 个直系子女分支，`),
+    document.createTextNode('支系内关系 '),
+    el('strong', { text: `${v.edges.length} 条` }),
+    document.createTextNode('（仅含两端都在支系中的父母→子女关系，支系外成员不带入）。'),
+  ]));
+  if (v.truncated) {
+    summary.appendChild(el('div', {
+      class: 'desc-truncated',
+      text: `代限边界上还有 ${v.boundaryCount} 条通向 ${v.maxGenerations} 代之外子女的关系未展开：提高代数上限可查看更多后代。`,
+    }));
+  }
+  box.appendChild(summary);
+
+  if (memberCount === 0) {
+    box.appendChild(el('div', { class: 'summary no-match' }, [
+      el('strong', { text: `「${v.rootName}」在 ${v.maxGenerations} 代内没有登记的后代。` }),
+      el('div', { text: '请在「② 父母 → 子女关系」中补录以该成员为父母的关系后重新提取。' }),
+    ]));
+    return;
+  }
+
+  // 分支图例
+  if (v.branches.length > 0) {
+    const legend = el('div', { class: 'desc-legend' });
+    legend.appendChild(el('span', { class: 'desc-legend-label', text: '分支：' }));
+    for (const b of v.branches) {
+      legend.appendChild(el('span', { class: 'branch-tag', text: b.name }));
+    }
+    box.appendChild(legend);
+  }
+
+  const branchesById = new Map(v.memberBranches.map((m) => [m.id, m]));
+
+  // 按最短代数分组展示
+  const byGen = new Map();
+  for (const m of v.members) {
+    if (m.generation === 0) continue;
+    if (!byGen.has(m.generation)) byGen.set(m.generation, []);
+    byGen.get(m.generation).push(m);
+  }
+  for (const gen of [...byGen.keys()].sort((a, b) => a - b)) {
+    const group = el('div', { class: 'desc-gen' });
+    group.appendChild(el('h3', { class: 'list-title', text: `第 ${gen} 代（${byGen.get(gen).length} 人）` }));
+    const ul = el('ul', { class: 'desc-member-list' });
+    for (const m of byGen.get(gen)) {
+      const li = el('li');
+      li.appendChild(el('span', { class: 'name', text: m.name }));
+      const mb = branchesById.get(m.id);
+      const names = mb ? mb.branchNames : [];
+      if (names.length > 0) {
+        const tags = el('span', { class: 'desc-branch-tags' });
+        for (const name of names) tags.appendChild(el('span', { class: 'branch-tag', text: name }));
+        li.appendChild(tags);
+      } else {
+        li.appendChild(el('span', { class: 'sub', text: '（无分支：关系链在代限外）' }));
+      }
+      ul.appendChild(li);
+    }
+    group.appendChild(ul);
+    box.appendChild(group);
+  }
+
+  // 支系内关系清单（两端都在支系中）
+  const edgeBox = el('div', { class: 'desc-edges' });
+  edgeBox.appendChild(el('h3', { class: 'list-title', text: `支系内关系（${v.edges.length} 条）` }));
+  if (v.edges.length === 0) {
+    edgeBox.appendChild(el('p', { class: 'empty-hint', text: '始祖与其已登记后代之间缺少连接关系（可能仅有隔代成员而漏录了中间世代）。' }));
+  } else {
+    const ul = el('ul', { class: 'edge-list' });
+    for (const e of v.edges) {
+      ul.appendChild(el('li', {}, [
+        el('span', { class: 'edge-text' }, [
+          el('span', { class: 'p-name', text: e.parentName }),
+          document.createTextNode(' → '),
+          el('span', { class: 'c-name', text: e.childName }),
+        ]),
+      ]));
+    }
+    edgeBox.appendChild(ul);
+  }
+  box.appendChild(edgeBox);
+
+  box.appendChild(el('p', {
+    class: 'empty-hint',
+    text: '下载文件为局部导出（成员 ID、姓名、代数、分支及关系），仅含所选支系，不是整谱备份，不能用于备份恢复。',
+  }));
 }
 
 /* ---------------- 启动 ---------------- */

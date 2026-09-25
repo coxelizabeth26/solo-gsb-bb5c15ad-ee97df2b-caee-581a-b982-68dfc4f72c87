@@ -8,6 +8,7 @@ const {
   findGenerationConflicts,
   validateEdge,
   previewEdgeImpact,
+  findDescendants,
 } = require('./familyGraph');
 const { parseLocalDate, upcomingAnniversaries } = require('./anniversaries');
 
@@ -487,6 +488,143 @@ app.get('/api/generation-conflicts', (req, res) => {
       longestPath: decoratePath(c.longestPath),
     })),
   });
+});
+
+/**
+ * 解析后代支系视图的查询参数：root 必填，maxGenerations 省略时取 3，
+ * 必须是 1..10 的整数。返回 { rootId, maxGenerations } 或 { error, status }。
+ */
+function parseDescendantsQuery(query) {
+  const rootId = typeof query.root === 'string' ? query.root.trim() : '';
+  if (!rootId) return { error: '请选择始祖成员', status: 400 };
+  let maxGenerations = 3;
+  if (query.maxGenerations !== undefined && query.maxGenerations !== '') {
+    const parsed = Number.parseInt(query.maxGenerations, 10);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10) {
+      return { error: '代数上限必须是 1 到 10 之间的整数', status: 400 };
+    }
+    maxGenerations = parsed;
+  }
+  return { rootId, maxGenerations };
+}
+
+/**
+ * 计算后代支系视图并补上姓名（只读，不写入任何数据）。
+ * 同一后代只出现一次、按距始祖的最短代数分组，并标记其所属的每个始祖直系子女分支；
+ * 关系只含两端都在支系内的父母→子女边。响应携带当前家谱版本 version，
+ * 成员或关系变更后重新查询即得到按最新状态重算的结果。
+ */
+function buildDescendantsView(rootId, maxGenerations) {
+  const result = findDescendants(store.getState(), rootId, maxGenerations);
+  if (result.error) {
+    return { error: result.error, status: result.error === '成员不存在' ? 404 : 400 };
+  }
+
+  const byId = new Map(store.list().members.map((m) => [m.id, m.name]));
+  const nameOf = (id) => byId.get(id) || '（已删除）';
+
+  const members = result.members
+    .map((m) => ({ id: m.id, name: nameOf(m.id), generation: m.generation }))
+    .sort((a, b) => {
+      if (a.generation !== b.generation) return a.generation - b.generation;
+      const na = a.name.localeCompare(b.name, 'zh');
+      return na !== 0 ? na : a.id.localeCompare(b.id);
+    });
+  const branches = result.branches
+    .map((id) => ({ id, name: nameOf(id) }))
+    .sort((a, b) => {
+      const n = a.name.localeCompare(b.name, 'zh');
+      return n !== 0 ? n : a.id.localeCompare(b.id);
+    });
+  const branchNameById = new Map(branches.map((b) => [b.id, b.name]));
+  const memberBranches = result.memberBranches
+    .map((m) => ({
+      id: m.id,
+      name: nameOf(m.id),
+      generation: result.members.find((x) => x.id === m.id).generation,
+      branchIds: m.branchIds,
+      branchNames: m.branchIds.map((id) => branchNameById.get(id) || nameOf(id)),
+    }))
+    .sort((a, b) => {
+      if (a.generation !== b.generation) return a.generation - b.generation;
+      const na = a.name.localeCompare(b.name, 'zh');
+      return na !== 0 ? na : a.id.localeCompare(b.id);
+    });
+  const edges = result.edges.map((e) => ({
+    parentId: e.parentId,
+    parentName: nameOf(e.parentId),
+    childId: e.childId,
+    childName: nameOf(e.childId),
+  }));
+
+  return {
+    error: null,
+    view: {
+      version: store.getVersion(),
+      rootId: result.rootId,
+      rootName: nameOf(result.rootId),
+      maxGenerations: result.maxGenerations,
+      truncated: result.truncated,
+      boundaryCount: result.boundaryCount,
+      members,
+      branches,
+      memberBranches,
+      edges,
+    },
+  };
+}
+
+/**
+ * 后代支系视图（只读）：GET /api/descendants?root=<id>&maxGenerations=1..10
+ */
+app.get('/api/descendants', (req, res) => {
+  const params = parseDescendantsQuery(req.query);
+  if (params.error) return sendError(res, params.status, params.error);
+  const built = buildDescendantsView(params.rootId, params.maxGenerations);
+  if (built.error) return sendError(res, built.status, built.error);
+  res.json(built.view);
+});
+
+/**
+ * 下载当前后代支系视图的局部导出 JSON（只读）：
+ * GET /api/descendants/export?root=<id>&maxGenerations=1..10
+ * 文件含成员 ID、姓名、代数、所属分支与关系，并以 exportKind / note 明确注明
+ * 这是**局部导出**（仅所选始祖在代限内的支系，且不含支系外成员），**不是整谱备份**、
+ * 不能用于 /api/backup/restore 整体恢复。
+ */
+app.get('/api/descendants/export', (req, res) => {
+  const params = parseDescendantsQuery(req.query);
+  if (params.error) return sendError(res, params.status, params.error);
+  const built = buildDescendantsView(params.rootId, params.maxGenerations);
+  if (built.error) return sendError(res, built.status, built.error);
+  const v = built.view;
+
+  const payload = {
+    exportKind: 'descendant-branch-partial',
+    note: '这是后代支系视图的局部导出，仅包含所选始祖在指定代数上限内的后代支系，不是整谱备份，不能用于备份恢复。',
+    exportedAt: new Date().toISOString(),
+    version: v.version,
+    root: { id: v.rootId, name: v.rootName },
+    maxGenerations: v.maxGenerations,
+    truncated: v.truncated,
+    boundaryCount: v.boundaryCount,
+    members: v.members.map((m) => ({ id: m.id, name: m.name, generation: m.generation })),
+    branches: v.branches.map((b) => ({ id: b.id, name: b.name })),
+    memberBranches: v.memberBranches.map((m) => ({
+      id: m.id,
+      name: m.name,
+      generation: m.generation,
+      branchIds: m.branchIds,
+      branchNames: m.branchNames,
+    })),
+    edges: v.edges.map((e) => ({ parentId: e.parentId, childId: e.childId })),
+  };
+
+  const date = new Date().toISOString().slice(0, 10);
+  const safeName = v.rootName.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
+  const filename = `descendants-${safeName}-gen${v.maxGenerations}-${date}.json`;
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+  res.type('application/json').send(`${JSON.stringify(payload, null, 2)}\n`);
 });
 
 /** JSON 解析错误兜底 */

@@ -631,3 +631,71 @@ button.danger-link {
   outline: 2px solid rgba(37, 99, 235, 0.35);
   border-color: var(--primary);
 }
+
+/* 后代支系视图 */
+.desc-truncated {
+  margin-top: 6px;
+  color: #92400e;
+  font-size: 0.88rem;
+}
+
+.desc-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+
+.desc-legend-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.branch-tag {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border-radius: 999px;
+  padding: 1px 10px;
+  white-space: nowrap;
+}
+
+.desc-gen {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px 12px;
+  margin-bottom: 10px;
+}
+
+.desc-gen .list-title { margin: 0 0 8px; }
+
+.desc-member-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.desc-member-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 5px 2px;
+  border-bottom: 1px dashed var(--border);
+  font-size: 0.93rem;
+}
+
+.desc-member-list li:last-child { border-bottom: none; }
+.desc-member-list .name { font-weight: 600; min-width: 64px; }
+
+.desc-branch-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.desc-edges { margin-top: 12px; }
+.desc-edges .list-title { margin-bottom: 8px; }
+.desc-edges .edge-list { max-height: 260px; }

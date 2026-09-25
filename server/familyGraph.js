@@ -12,6 +12,7 @@ const MAX_PARENTS_PER_CHILD = 2;
 const MAX_MEMBERS = 30;
 const MAX_BATCH_EDGES = 100;
 const MAX_BACKUP_NAME_LENGTH = 50;
+const MAX_DESCENDANT_GENERATIONS = 10;
 
 const { ANNIVERSARY_TYPES, TYPE_LABEL, validateMonthDay } = require('./anniversaries');
 
@@ -625,6 +626,121 @@ function findGenerationConflicts(state, filterId = null) {
 }
 
 /**
+ * 后代支系视图（纯函数，不修改 state、不写入任何数据）。
+ *
+ * 选择现有成员 rootId 作为始祖，沿「父母 → 子女」关系向下提取至多 maxGenerations 代后代：
+ *   - 同一后代可能通过多条路径（如同时经父系、母系）到达，只输出一次，
+ *     代数取其距始祖的**最短代数**（向下 BFS 首达步数：始祖本人 0 代、直系子女 1 代……），
+ *     结果按最短代数分组；
+ *   - 每名后代标记其所属的**每一个**始祖直系子女分支：从始祖的某位直系子女 b 出发，
+ *     在剩余代限（maxGenerations - 1）以内沿子女链可以到达该后代，即标记 b 所属分支
+ *     （各分支单独做带深度预算的向下遍历，因此即便某条路径因代限被截断，
+ *     另一条更短路径仍可命中；同代多路径钻石结构下后代可同时属于多个分支）；
+ *   - 关系只保留**两端都在所选支系内**的父母→子女边，绝不带入支系外成员；
+ *   - 代限边界上若还有通向支系外子女的边，truncated 置为 true，提示视图在代限处截断。
+ *
+ * maxGenerations 必须是 1..MAX_DESCENDANT_GENERATIONS 的整数；rootId 必须是现有成员，
+ * 否则返回 { error }。
+ *
+ * 返回 {
+ *   rootId, maxGenerations,
+ *   members: [{ id, generation }],                 // 始祖本人 0 代；按代数、ID 排序
+ *   branches: [{ id }],                            // 始祖的直系子女（1 代），即各分支根
+ *   memberBranches: [{ id, branchIds: [id] }],     // 各后代（不含始祖）所属的每个分支
+ *   edges: [{ parentId, childId }],                // 两端都在支系内的关系，按子女、父母排序
+ *   truncated,                                     // 代限边界上是否还有未展开的子女
+ *   boundaryCount,                                 // 通向代限之外子女的边数
+ * }
+ */
+function findDescendants(state, rootId, maxGenerations) {
+  if (!Number.isInteger(maxGenerations) || maxGenerations < 1 || maxGenerations > MAX_DESCENDANT_GENERATIONS) {
+    return { error: `代数上限必须是 1 到 ${MAX_DESCENDANT_GENERATIONS} 之间的整数` };
+  }
+  if (!hasMember(state, rootId)) return { error: '成员不存在' };
+
+  // 子女邻接表：childrenOf[parent] = [child, ...]（沿父母→子女向下）
+  const childrenOf = {};
+  for (const childId of Object.keys(state.parentsOf || {})) {
+    for (const parentId of state.parentsOf[childId] || []) {
+      (childrenOf[parentId] ||= []).push(childId);
+    }
+  }
+
+  // 向下 BFS：记录距始祖的最短代数；同一成员再次以相同代数到达时无需重复展开
+  // （图为 DAG，后续代数只增不减）。
+  const generationOf = new Map([[rootId, 0]]);
+  const queue = [rootId];
+  for (let head = 0; head < queue.length; head++) {
+    const cur = queue[head];
+    const gen = generationOf.get(cur);
+    if (gen >= maxGenerations) continue;
+    for (const child of childrenOf[cur] || []) {
+      if (!generationOf.has(child)) {
+        generationOf.set(child, gen + 1);
+        queue.push(child);
+      }
+    }
+  }
+
+  const inSet = (id) => generationOf.has(id);
+  const branches = (childrenOf[rootId] || []).filter(inSet);
+
+  // 对每个直系子女分支单独做带深度预算的向下遍历：
+  // 从分支根（1 代）出发还可向下走 maxGenerations - 1 步，预算内可达的支系成员
+  // 都属于该分支。首次到达的深度即最短分支路径，只展开一次即可保证全部可达性。
+  const branchesOf = new Map(); // memberId -> Set<branchRootId>
+  for (const branchRoot of branches) {
+    const reached = new Map([[branchRoot, 1]]);
+    const branchQueue = [branchRoot];
+    for (let head = 0; head < branchQueue.length; head++) {
+      const cur = branchQueue[head];
+      const depth = reached.get(cur);
+      if (!branchesOf.has(cur)) branchesOf.set(cur, new Set());
+      branchesOf.get(cur).add(branchRoot);
+      if (depth >= maxGenerations) continue;
+      for (const child of childrenOf[cur] || []) {
+        if (!inSet(child) || reached.has(child)) continue;
+        reached.set(child, depth + 1);
+        branchQueue.push(child);
+      }
+    }
+  }
+
+  // 仅保留两端都在支系内的关系；顺带统计代限边界通向支系外子女的边
+  const edges = [];
+  let boundaryCount = 0;
+  for (const [parentId, children] of Object.entries(childrenOf)) {
+    if (!inSet(parentId)) continue;
+    for (const childId of children) {
+      if (inSet(childId)) edges.push({ parentId, childId });
+      else if (generationOf.get(parentId) >= maxGenerations) boundaryCount += 1;
+    }
+  }
+  edges.sort((a, b) =>
+    a.childId !== b.childId ? a.childId.localeCompare(b.childId) : a.parentId.localeCompare(b.parentId));
+  branches.sort((a, b) => a.localeCompare(b));
+
+  const members = [...generationOf.keys()]
+    .map((id) => ({ id, generation: generationOf.get(id) }))
+    .sort((a, b) =>
+      a.generation !== b.generation ? a.generation - b.generation : a.id.localeCompare(b.id));
+  const memberBranches = members
+    .filter((m) => m.id !== rootId)
+    .map((m) => ({ id: m.id, branchIds: [...(branchesOf.get(m.id) || [])].sort((a, b) => a.localeCompare(b)) }));
+
+  return {
+    rootId,
+    maxGenerations,
+    members,
+    branches,
+    memberBranches,
+    edges,
+    truncated: boundaryCount > 0,
+    boundaryCount,
+  };
+}
+
+/**
  * 变更影响预览（纯函数，不修改 state、不写入任何数据）。
  *
  * 以当前家谱为基准，假设应用一条变更，构造不落盘的假设图：
@@ -973,6 +1089,7 @@ module.exports = {
   MAX_MEMBERS,
   MAX_BATCH_EDGES,
   MAX_BACKUP_NAME_LENGTH,
+  MAX_DESCENDANT_GENERATIONS,
   createState,
   getMember,
   isReachableUp,
@@ -984,5 +1101,6 @@ module.exports = {
   findCommonAncestors,
   ancestorProfiles,
   findGenerationConflicts,
+  findDescendants,
   previewEdgeImpact,
 };

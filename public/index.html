@@ -15,6 +15,7 @@
       选中两人即可沿父母链查询总代数最少的全部共同祖先及最短亲缘路径；
       还可一键核查全部「辈分矛盾」：同一对祖先与后代沿不同路径的最少 / 最多代数不一致时逐条列出；
       「变更影响预览」可在不落盘的假设图上试算新增 / 移除一条关系前后辈分矛盾的逐对变化；
+      「后代支系视图」可选择始祖与 1～10 代上限，按最短代数提取去重后代、标记其所属的每个直系子女分支，并下载局部导出 JSON；
       「备份与恢复」可下载仅含成员 ID、姓名、纪念日与关系的 JSON 备份，选择备份文件预览校验后整体恢复（可撤销）；
       「成员纪念日」可为每名成员登记一个生日与一个忌日（公历月日），并查看包含今天在内的未来 30 天纪念日清单。
     </p>
@@ -181,6 +182,44 @@
       </p>
       <div id="impact-result" class="result" aria-live="polite">
         <p class="placeholder">选择变更类型与父母、子女后点击「预览影响」。</p>
+      </div>
+    </section>
+
+    <!-- 后代支系视图 -->
+    <section class="card wide" aria-labelledby="descendants-title">
+      <h2 id="descendants-title">⑧ 后代支系视图</h2>
+      <form id="descendants-form" class="edge-form">
+        <label>
+          始祖（选择现有成员）
+          <select id="descendants-root"></select>
+        </label>
+        <label>
+          代数上限（1～10 代）
+          <select id="descendants-depth">
+            <option value="1">1 代（仅直系子女）</option>
+            <option value="2">2 代</option>
+            <option value="3" selected>3 代</option>
+            <option value="4">4 代</option>
+            <option value="5">5 代</option>
+            <option value="6">6 代</option>
+            <option value="7">7 代</option>
+            <option value="8">8 代</option>
+            <option value="9">9 代</option>
+            <option value="10">10 代</option>
+          </select>
+        </label>
+        <button type="submit" class="primary">提取后代支系</button>
+        <button type="button" id="descendants-download" disabled>下载当前结果（JSON）</button>
+      </form>
+      <p class="empty-hint">
+        沿「父母 → 子女」关系提取始祖的后代：同一后代经多条路径到达时<strong>只显示一次</strong>，
+        按距始祖的<strong>最短代数</strong>分组，并标记其所属的<strong>每个始祖直系子女分支</strong>
+        （同代多路径时可同时属于多个分支）。只展示<strong>两端都在所选支系中</strong>的关系，不带入支系外成员。
+        查询为只读，成员或关系变更后自动按最新状态重算。下载的 JSON 为<strong>局部导出</strong>
+        （成员 ID、姓名、代数、分支及关系），<strong>不是整谱备份</strong>，不能用于备份恢复。
+      </p>
+      <div id="descendants-result" class="result" aria-live="polite">
+        <p class="placeholder">选择一位始祖与代数上限后点击「提取后代支系」。</p>
       </div>
     </section>
 
